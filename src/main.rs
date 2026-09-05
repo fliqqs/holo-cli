@@ -211,19 +211,29 @@ fn main() {
                 .short("a")
                 .long("address")
                 .value_name("ADDRESS")
-                .help("Holo daemon IPv4/6 address: http://IP:Port")
+                .help(
+                    "Holo daemon address: a Unix socket path, or http://IP:Port",
+                )
                 .multiple(false),
         )
         .get_matches();
 
     // Connect to the daemon.
+    //
+    // The default matches holod's own default listening address. A TCP
+    // listener requires TLS and user credentials, which this client does not
+    // provide, so the Unix socket is the only transport that works without
+    // further configuration.
     let raw_addr = matches
         .value_of("address")
-        .unwrap_or("127.0.0.1:50051") // no http:// in default
+        .unwrap_or("/var/opt/holo/holod.sock")
         .to_string();
 
-    // Prepend http:// if not already present
-    let addr = if raw_addr.starts_with("http://")
+    // A leading slash means a Unix socket path, matching how holod itself
+    // distinguishes the two. Anything else is a TCP endpoint, to which
+    // http:// is prepended if absent.
+    let addr = if raw_addr.starts_with('/')
+        || raw_addr.starts_with("http://")
         || raw_addr.starts_with("https://")
     {
         raw_addr
