@@ -57,12 +57,7 @@ impl Session {
         let yang_ctx = YANG_CTX.get().unwrap();
         let data_format = DataFormat::LYB;
         let running = grpc_client
-            .get(
-                proto::get_request::DataType::Config,
-                data_format,
-                false,
-                None,
-            )
+            .get(crate::grpc::DataType::Config, data_format, false, None)
             .unwrap();
         let running = DataTree::parse_string(
             yang_ctx,
@@ -310,7 +305,7 @@ impl Session {
 
     pub fn get(
         &mut self,
-        data_type: proto::get_request::DataType,
+        data_type: crate::grpc::DataType,
         format: DataFormat,
         with_defaults: bool,
         xpath: Option<String>,

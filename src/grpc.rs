@@ -10,12 +10,25 @@ use std::os::raw::{c_char, c_void};
 
 use proto::northbound_client::NorthboundClient;
 use yang5::data::{
-    Data, DataDiffFlags, DataFormat, DataPrinterFlags, DataTree,
+    Data, DataDiffFlags, DataFormat, DataParserFlags, DataPrinterFlags,
+    DataTree, DataValidationFlags,
 };
 use yang5::ffi;
 
 use crate::YANG_MODULES_DIR;
 use crate::error::Error;
+
+/// Which part of the datastore to fetch.
+///
+/// holod splits this across two RPCs, `GetConfig` and `GetState`, and no
+/// longer offers a combined fetch; [`DataType::All`] therefore issues both and
+/// merges the results client-side.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataType {
+    All,
+    Config,
+    State,
+}
 
 pub mod proto {
     tonic::include_proto!("holo");
@@ -44,12 +57,44 @@ impl GrpcClient {
             .expect("Failed to obtain a new runtime object");
 
         // Connect to holod.
-        let client = runtime
-            .block_on(NorthboundClient::connect(dest))?
+        let channel = runtime.block_on(Self::channel(dest))?;
+        let client = NorthboundClient::new(channel)
             .max_encoding_message_size(usize::MAX)
             .max_decoding_message_size(usize::MAX);
 
         Ok(GrpcClient { client, runtime })
+    }
+
+    // Opens a channel to holod.
+    //
+    // An address starting with a slash is a Unix socket path; the authority
+    // in the placeholder URI is unused in that case, since the connector
+    // dials the socket directly.
+    async fn channel(
+        dest: &'static str,
+    ) -> Result<tonic::transport::Channel, StdError> {
+        if let Some(path) = dest.strip_prefix('/') {
+            let path = format!("/{path}");
+            let channel = tonic::transport::Endpoint::try_from("http://holod")?
+                .connect_with_connector(tower::service_fn(
+                    move |_: tonic::transport::Uri| {
+                        let path = path.clone();
+                        async move {
+                            let stream =
+                                tokio::net::UnixStream::connect(path).await?;
+                            Ok::<_, std::io::Error>(
+                                hyper_util::rt::TokioIo::new(stream),
+                            )
+                        }
+                    },
+                ))
+                .await?;
+            return Ok(channel);
+        }
+
+        Ok(tonic::transport::Endpoint::try_from(dest)?
+            .connect()
+            .await?)
     }
 
     pub fn load_modules(
@@ -97,15 +142,39 @@ impl GrpcClient {
 
     pub fn get(
         &mut self,
-        data_type: proto::get_request::DataType,
+        data_type: DataType,
+        format: DataFormat,
+        with_defaults: bool,
+        xpath: Option<String>,
+    ) -> Result<proto::data_tree::Data, Error> {
+        match data_type {
+            DataType::Config => self.get_config(format, with_defaults, xpath),
+            DataType::State => self.get_state(format, with_defaults, xpath),
+            DataType::All => {
+                // Fetched over LYB regardless of the requested format, since
+                // the two trees have to be parsed to be merged and LYB is
+                // the cheapest round trip.
+                let config = self.get_config(
+                    DataFormat::LYB,
+                    with_defaults,
+                    xpath.clone(),
+                )?;
+                let state =
+                    self.get_state(DataFormat::LYB, with_defaults, xpath)?;
+                Self::merge(config, state, format)
+            }
+        }
+    }
+
+    fn get_config(
+        &mut self,
         format: DataFormat,
         with_defaults: bool,
         xpath: Option<String>,
     ) -> Result<proto::data_tree::Data, Error> {
         let path = xpath.map(|x| proto::Path::from_xpath(&x));
         let data = self
-            .rpc_sync_get(proto::GetRequest {
-                r#type: data_type as i32,
+            .rpc_sync_get_config(proto::GetConfigRequest {
                 encoding: proto::Encoding::from(format) as i32,
                 with_defaults,
                 path,
@@ -115,6 +184,66 @@ impl GrpcClient {
             .data
             .unwrap();
         Ok(data.data.unwrap())
+    }
+
+    fn get_state(
+        &mut self,
+        format: DataFormat,
+        with_defaults: bool,
+        xpath: Option<String>,
+    ) -> Result<proto::data_tree::Data, Error> {
+        let path = xpath.map(|x| proto::Path::from_xpath(&x));
+        let data = self
+            .rpc_sync_get_state(proto::GetStateRequest {
+                encoding: proto::Encoding::from(format) as i32,
+                with_defaults,
+                path,
+            })
+            .map_err(Error::Backend)?
+            .into_inner()
+            .data
+            .unwrap();
+        Ok(data.data.unwrap())
+    }
+
+    // Merges a configuration tree and a state tree into one, re-encoded in
+    // the requested format.
+    fn merge(
+        config: proto::data_tree::Data,
+        state: proto::data_tree::Data,
+        format: DataFormat,
+    ) -> Result<proto::data_tree::Data, Error> {
+        let yang_ctx = crate::YANG_CTX.get().unwrap();
+        let parse = |data: &proto::data_tree::Data| {
+            DataTree::parse_string(
+                yang_ctx,
+                data.as_bytes().unwrap(),
+                DataFormat::LYB,
+                DataParserFlags::NO_VALIDATION,
+                DataValidationFlags::empty(),
+            )
+        };
+
+        let mut dtree = parse(&config).map_err(Error::ValidateConfig)?;
+        let state = parse(&state).map_err(Error::ValidateConfig)?;
+        dtree.merge(&state).map_err(Error::ValidateConfig)?;
+
+        // LYB is binary, so it must go through the byte printer rather than
+        // the string one.
+        Ok(match format {
+            DataFormat::LYB => {
+                let bytes = dtree
+                    .print_bytes(format, DataPrinterFlags::WITH_SIBLINGS)
+                    .map_err(Error::ValidateConfig)?;
+                proto::data_tree::Data::DataBytes(bytes)
+            }
+            _ => {
+                let string = dtree
+                    .print_string(format, DataPrinterFlags::WITH_SIBLINGS)
+                    .map_err(Error::ValidateConfig)?;
+                proto::data_tree::Data::DataString(string)
+            }
+        })
     }
 
     pub fn validate_candidate(
@@ -183,12 +312,20 @@ impl GrpcClient {
         self.runtime.block_on(self.client.get_schema(request))
     }
 
-    fn rpc_sync_get(
+    fn rpc_sync_get_config(
         &mut self,
-        request: proto::GetRequest,
-    ) -> Result<tonic::Response<proto::GetResponse>, tonic::Status> {
+        request: proto::GetConfigRequest,
+    ) -> Result<tonic::Response<proto::GetConfigResponse>, tonic::Status> {
         let request = tonic::Request::new(request);
-        self.runtime.block_on(self.client.get(request))
+        self.runtime.block_on(self.client.get_config(request))
+    }
+
+    fn rpc_sync_get_state(
+        &mut self,
+        request: proto::GetStateRequest,
+    ) -> Result<tonic::Response<proto::GetStateResponse>, tonic::Status> {
+        let request = tonic::Request::new(request);
+        self.runtime.block_on(self.client.get_state(request))
     }
 
     fn rpc_sync_commit(
@@ -266,7 +403,8 @@ impl proto::Path {
                     Some(pos) => {
                         let name = &segment[..pos];
                         let mut keys = HashMap::new();
-                        for kv in segment[pos..].split('[').filter(|s| !s.is_empty())
+                        for kv in
+                            segment[pos..].split('[').filter(|s| !s.is_empty())
                         {
                             let kv = kv.trim_end_matches(']');
                             if let Some(eq_pos) = kv.find('=') {
